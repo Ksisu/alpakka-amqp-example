@@ -1,18 +1,19 @@
 package hu.ksisu.example
 
-import akka.Done
+import akka.{Done, NotUsed}
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
 import akka.stream.OverflowStrategy
 import akka.stream.QueueOfferResult.Enqueued
-import akka.stream.alpakka.amqp.scaladsl.AmqpSink
+import akka.stream.alpakka.amqp.scaladsl.{AmqpSink, AmqpSource}
 import akka.stream.alpakka.amqp.{
   AmqpCachedConnectionProvider,
   AmqpConnectionProvider,
   AmqpUriConnectionProvider,
   AmqpWriteSettings,
+  NamedQueueSourceSettings,
   QueueDeclaration
 }
 import akka.stream.scaladsl.{Keep, Sink, Source, SourceQueueWithComplete}
@@ -21,6 +22,7 @@ import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 object Main extends App {
   private implicit lazy val system           = ActorSystem("example-system")
@@ -33,13 +35,22 @@ object Main extends App {
   Http().bindAndHandle(api.route, "0.0.0.0", 9000)
 }
 
+object WorkerMain extends App {
+  private implicit lazy val system           = ActorSystem("example-worker-system")
+  private implicit lazy val executionContext = system.dispatcher
+
+  private implicit val queue   = new AmqpHelper()
+  private implicit val service = new WorkerService()
+  service.start()
+}
+
 class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
   private val connection: AmqpConnectionProvider = {
     AmqpCachedConnectionProvider(
       AmqpUriConnectionProvider("amqp://guest:guest@localhost")
     )
   }
-  private val queueName        = "queue-example-" + System.currentTimeMillis()
+  private val queueName        = "queue-example"
   private val queueDeclaration = QueueDeclaration(queueName)
 
   private val queue: SourceQueueWithComplete[ByteString] = {
@@ -68,6 +79,27 @@ class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
     }
   }
 
+  def getSource(): Source[(String, JsValue), NotUsed] = {
+    AmqpSource
+      .atMostOnceSource(
+        NamedQueueSourceSettings(connection, queueName)
+          .withDeclaration(queueDeclaration)
+          .withAckRequired(false),
+        bufferSize = 10
+      )
+      .mapConcat { readResult =>
+        Try(readResult.bytes.utf8String.parseJson)
+          .collect {
+            case jsonMsg: JsObject => jsonMsg.getFields("key", "data")
+          }
+          .collect {
+            case Seq(JsString(key), data) => key -> data
+          }
+          .map(List(_))
+          .getOrElse(List.empty)
+      }
+  }
+
 }
 
 class Service(implicit ec: ExecutionContext, amqp: AmqpHelper) {
@@ -82,6 +114,23 @@ class Service(implicit ec: ExecutionContext, amqp: AmqpHelper) {
     amqp.sendToQueue("bye", who).map { _ =>
       s"Bye $who!\n"
     }
+  }
+}
+
+class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper) {
+
+  private val stream = {
+    amqp
+      .getSource()
+      .collect {
+        case ("hello", JsString(value)) => println(s"WORKER: [hello]: $value")
+        case ("bye", JsString(value))   => println(s"WORKER: [bye]: $value")
+      }
+      .to(Sink.ignore)
+  }
+
+  def start(): Unit = {
+    stream.run()
   }
 }
 
