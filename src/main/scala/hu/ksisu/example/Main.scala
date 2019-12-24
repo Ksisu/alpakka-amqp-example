@@ -18,6 +18,7 @@ import akka.stream.alpakka.amqp.{
 }
 import akka.stream.scaladsl.{Keep, Sink, Source, SourceQueueWithComplete}
 import akka.util.ByteString
+import org.slf4j.{Logger, LoggerFactory}
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
@@ -25,6 +26,7 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Try
 
 object Main extends App {
+  private implicit lazy val logger           = LoggerFactory.getLogger("EXAMPLE-API")
   private implicit lazy val system           = ActorSystem("example-system")
   private implicit lazy val executionContext = system.dispatcher
 
@@ -36,6 +38,7 @@ object Main extends App {
 }
 
 object WorkerMain extends App {
+  private implicit lazy val logger           = LoggerFactory.getLogger("EXAMPLE-WORKER")
   private implicit lazy val system           = ActorSystem("example-worker-system")
   private implicit lazy val executionContext = system.dispatcher
 
@@ -44,7 +47,7 @@ object WorkerMain extends App {
   service.start()
 }
 
-class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
+class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext, logger: Logger) {
   private val connection: AmqpConnectionProvider = {
     AmqpCachedConnectionProvider(
       AmqpUriConnectionProvider("amqp://guest:guest@localhost")
@@ -73,6 +76,7 @@ class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
       "data" -> data.toJson
     )
     val msg = ByteString(jsonMsg.compactPrint)
+    logger.info(s"Send message to queue: ${msg.utf8String}")
     queue.offer(msg).map {
       case Enqueued => true
       case _        => false
@@ -88,7 +92,9 @@ class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
         bufferSize = 10
       )
       .mapConcat { readResult =>
-        Try(readResult.bytes.utf8String.parseJson)
+        val msg = readResult.bytes.utf8String
+        logger.info(s"Message received from queue: $msg")
+        Try(msg.parseJson)
           .collect {
             case jsonMsg: JsObject => jsonMsg.getFields("key", "data")
           }
@@ -102,29 +108,31 @@ class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext) {
 
 }
 
-class Service(implicit ec: ExecutionContext, amqp: AmqpHelper) {
+class Service(implicit ec: ExecutionContext, amqp: AmqpHelper, logger: Logger) {
 
   def sayHello(who: String): Future[String] = {
+    logger.info(s"SayHello: $who")
     amqp.sendToQueue("hello", who).map { _ =>
       s"Hello $who!\n"
     }
   }
 
   def sayBye(who: String): Future[String] = {
+    logger.info(s"SayBye: $who")
     amqp.sendToQueue("bye", who).map { _ =>
       s"Bye $who!\n"
     }
   }
 }
 
-class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper) {
+class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper, logger: Logger) {
 
   private val stream = {
     amqp
       .getSource()
       .collect {
-        case ("hello", JsString(value)) => println(s"WORKER: [hello]: $value")
-        case ("bye", JsString(value))   => println(s"WORKER: [bye]: $value")
+        case ("hello", JsString(value)) => logger.info(s"Msg processed - [hello]: $value")
+        case ("bye", JsString(value))   => logger.info(s"Msg processed - [bye]: $value")
       }
       .to(Sink.ignore)
   }
