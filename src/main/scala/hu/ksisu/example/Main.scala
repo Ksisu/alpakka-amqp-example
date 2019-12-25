@@ -18,6 +18,7 @@ import akka.stream.alpakka.amqp.{
 }
 import akka.stream.scaladsl.{Keep, Sink, Source, SourceQueueWithComplete}
 import akka.util.ByteString
+import hu.ksisu.example.WorkerService.ProcessorF
 import org.slf4j.{Logger, LoggerFactory}
 import spray.json._
 import spray.json.DefaultJsonProtocol._
@@ -44,6 +45,19 @@ object WorkerMain extends App {
 
   private implicit val queue   = new AmqpHelper()
   private implicit val service = new WorkerService()
+
+  val helloF: ProcessorF = {
+    case JsString(value) => Future(logger.info(s"Msg processed - [hello]: $value"))
+    case _               => Future.successful({})
+  }
+  val byeF: ProcessorF = {
+    case JsString(value) => Future(logger.info(s"Msg processed - [bye]: $value"))
+    case _               => Future.successful({})
+  }
+
+  service.addProcessor("hello", helloF)
+  service.addProcessor("bye", byeF)
+
   service.start()
 }
 
@@ -125,16 +139,26 @@ class Service(implicit ec: ExecutionContext, amqp: AmqpHelper, logger: Logger) {
   }
 }
 
-class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper, logger: Logger) {
+object WorkerService {
+  type ProcessorF = JsValue => Future[Unit]
+}
+
+class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper) {
+
+  private val processors = scala.collection.concurrent.TrieMap[String, ProcessorF]()
 
   private val stream = {
     amqp
       .getSource()
       .collect {
-        case ("hello", JsString(value)) => logger.info(s"Msg processed - [hello]: $value")
-        case ("bye", JsString(value))   => logger.info(s"Msg processed - [bye]: $value")
+        case (key, data) if processors.isDefinedAt(key) => processors(key)(data)
       }
+      .mapAsyncUnordered(10)(identity)
       .to(Sink.ignore)
+  }
+
+  def addProcessor(key: String, f: ProcessorF): Unit = {
+    processors += (key -> f)
   }
 
   def start(): Unit = {
