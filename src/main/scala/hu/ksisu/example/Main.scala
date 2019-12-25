@@ -16,7 +16,7 @@ import akka.stream.alpakka.amqp.{
   NamedQueueSourceSettings,
   QueueDeclaration
 }
-import akka.stream.scaladsl.{Keep, Sink, Source, SourceQueueWithComplete}
+import akka.stream.scaladsl.{Flow, Keep, Sink, Source, SourceQueueWithComplete}
 import akka.util.ByteString
 import hu.ksisu.example.WorkerService.ProcessorF
 import org.slf4j.{Logger, LoggerFactory}
@@ -43,22 +43,24 @@ object WorkerMain extends App {
   private implicit lazy val system           = ActorSystem("example-worker-system")
   private implicit lazy val executionContext = system.dispatcher
 
-  private implicit val queue   = new AmqpHelper()
-  private implicit val service = new WorkerService()
+  private val amqp = new AmqpHelper()
 
-  val helloF: ProcessorF = {
-    case JsString(value) => Future(logger.info(s"Msg processed - [hello]: $value"))
-    case _               => Future.successful({})
-  }
-  val byeF: ProcessorF = {
-    case JsString(value) => Future(logger.info(s"Msg processed - [bye]: $value"))
+  private def createProcessor(msg: String): ProcessorF = {
+    case JsString(value) => Future(logger.info(s"Msg processed - [$msg]: $value"))
     case _               => Future.successful({})
   }
 
-  service.addProcessor("hello", helloF)
-  service.addProcessor("bye", byeF)
+  private val processorFlow = WorkerService.createFlow(parallelism = 10)(
+    "hello" -> createProcessor("hellp"),
+    "bye"   -> createProcessor("bye")
+  )
 
-  service.start()
+  private val stream = amqp
+    .getSource()
+    .via(processorFlow)
+    .to(Sink.ignore)
+
+  stream.run()
 }
 
 class AmqpHelper(implicit as: ActorSystem, ec: ExecutionContext, logger: Logger) {
@@ -141,28 +143,14 @@ class Service(implicit ec: ExecutionContext, amqp: AmqpHelper, logger: Logger) {
 
 object WorkerService {
   type ProcessorF = JsValue => Future[Unit]
-}
 
-class WorkerService(implicit as: ActorSystem, amqp: AmqpHelper) {
-
-  private val processors = scala.collection.concurrent.TrieMap[String, ProcessorF]()
-
-  private val stream = {
-    amqp
-      .getSource()
+  def createFlow(parallelism: Int)(processors: (String, ProcessorF)*): Flow[(String, JsValue), Unit, NotUsed] = {
+    val processorsMap = processors.toMap
+    Flow[(String, JsValue)]
       .collect {
-        case (key, data) if processors.isDefinedAt(key) => processors(key)(data)
+        case (key, data) if processorsMap.isDefinedAt(key) => processorsMap(key)(data)
       }
-      .mapAsyncUnordered(10)(identity)
-      .to(Sink.ignore)
-  }
-
-  def addProcessor(key: String, f: ProcessorF): Unit = {
-    processors += (key -> f)
-  }
-
-  def start(): Unit = {
-    stream.run()
+      .mapAsyncUnordered(parallelism)(identity)
   }
 }
 
